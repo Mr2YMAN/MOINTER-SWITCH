@@ -216,6 +216,123 @@ def apply_profile(control_path: str, profile: str) -> list[dict[str, str]]:
     return results
 
 
+def power_monitor(
+    control_path: str,
+    monitor_handle: str,
+    state: str,
+    input_after_on: str | None = None,
+    aggressive_on: bool = False,
+) -> dict[str, str]:
+    if state not in ("on", "off"):
+        raise ValueError("Unsupported power state. Use 'on' or 'off'.")
+
+    print(f"Power '{state}' for '{monitor_handle}'...")
+    if state == "off":
+        run_tool(control_path, ["/TurnOff", monitor_handle])
+        print("Done.")
+        return {"monitor": monitor_handle, "power": state, "status": "ok"}
+
+    # Wake sequence: TurnOn + D6=1, with retries.
+    attempts = 6 if aggressive_on else 3
+    last_error: Exception | None = None
+    for idx in range(attempts):
+        try:
+            run_tool(control_path, ["/TurnOn", monitor_handle])
+            run_tool(control_path, ["/SetValue", monitor_handle, "D6", "1"])
+
+            # Some panels wake better with a pulse in between retries.
+            if aggressive_on and idx in (2, 4):
+                run_tool(control_path, ["/SwitchOffOn", monitor_handle])
+
+            last_error = None
+            time.sleep(0.25)
+            break
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.35)
+
+    if last_error is not None:
+        raise last_error
+
+    # Optional input nudge helps some panels wake fully.
+    if input_after_on:
+        switch_input(control_path, monitor_handle, input_after_on, verify=False)
+
+    print("Done.")
+    result = {"monitor": monitor_handle, "power": state, "status": "ok"}
+    if input_after_on:
+        result["input_after_on"] = input_after_on
+    if aggressive_on:
+        result["aggressive_on"] = "true"
+    return result
+
+
+def apply_power(control_path: str, state: str, input_after_on: str | None = None) -> list[dict[str, str]]:
+    if state not in ("on", "off"):
+        raise ValueError("Unsupported power state. Use 'on' or 'off'.")
+
+    # Power-off should include all configured monitors.
+    # Power-on is disabled at endpoint level, but keep sensible defaults here.
+    if state == "off":
+        targets = [PRESET_MONITORS["xg27"], PRESET_MONITORS["aorus"], PRESET_MONITORS["lg"]]
+    else:
+        targets = [PRESET_MONITORS["xg27"], PRESET_MONITORS["aorus"]]
+    results: list[dict[str, str]] = []
+    for handle in targets:
+        try:
+            results.append(
+                power_monitor(
+                    control_path,
+                    handle,
+                    state,
+                    input_after_on=input_after_on,
+                    aggressive_on=False,
+                )
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "monitor": handle,
+                    "power": state,
+                    "status": "error",
+                    "error": str(exc),
+                }
+            )
+    return results
+
+
+def apply_single_power(
+    control_path: str,
+    monitor_key: str,
+    state: str,
+    input_after_on: str | None = None,
+    aggressive_on: bool = False,
+) -> list[dict[str, str]]:
+    if monitor_key not in PRESET_MONITORS:
+        raise ValueError("Unsupported monitor key.")
+
+    handle = PRESET_MONITORS[monitor_key]
+    try:
+        return [
+            power_monitor(
+                control_path,
+                handle,
+                state,
+                input_after_on=input_after_on,
+                aggressive_on=aggressive_on,
+            )
+        ]
+    except Exception as exc:
+        return [
+            {
+                "monitor": handle,
+                "power": state,
+                "status": "error",
+                "error": str(exc),
+            }
+        ]
+
+
 def run_http_server(control_path: str, host: str, port: int) -> int:
     class SwitchHandler(BaseHTTPRequestHandler):
         def _write_json(self, status_code: int, payload: dict[str, object]) -> None:
@@ -236,12 +353,24 @@ def run_http_server(control_path: str, host: str, port: int) -> int:
                     {
                         "ok": True,
                         "service": "monitor-switch",
-                        "routes": ["/mac", "/pc", "/set?profile=mac|pc"],
+                        "routes": [
+                            "/mac",
+                            "/pc",
+                            "/set?profile=mac|pc",
+                            "/off",
+                            "/power?action=off",
+                            "/aorus/off",
+                        ],
                     },
                 )
                 return
 
             profile = ""
+            power = ""
+            input_after_on: str | None = None
+            single_monitor: str | None = None
+            aggressive_on = False
+            on_request_disabled = False
             if path == "/mac":
                 profile = "mac"
             elif path == "/pc":
@@ -249,19 +378,86 @@ def run_http_server(control_path: str, host: str, port: int) -> int:
             elif path == "/set":
                 query = parse_qs(parsed.query)
                 profile = (query.get("profile", [""])[0] or "").lower()
+            elif path == "/on":
+                on_request_disabled = True
+            elif path == "/off":
+                power = "off"
+            elif path == "/power":
+                query = parse_qs(parsed.query)
+                power = (query.get("action", [""])[0] or "").lower()
+                if power == "on":
+                    on_request_disabled = True
+                    power = ""
+            elif path == "/aorus/on":
+                on_request_disabled = True
+            elif path == "/aorus/off":
+                single_monitor = "aorus"
+                power = "off"
 
-            if profile not in ("mac", "pc"):
-                self._write_json(400, {"ok": False, "error": "Use /mac, /pc, or /set?profile=mac|pc"})
+            if profile in ("mac", "pc"):
+                results = apply_profile(control_path, profile)
+                has_error = any(item.get("status") != "ok" for item in results)
+                self._write_json(
+                    200 if not has_error else 500,
+                    {
+                        "ok": not has_error,
+                        "profile": profile,
+                        "results": results,
+                    },
+                )
                 return
 
-            results = apply_profile(control_path, profile)
-            has_error = any(item.get("status") != "ok" for item in results)
+            if on_request_disabled:
+                self._write_json(
+                    501,
+                    {
+                        "ok": False,
+                        "error": "Power-on endpoint is disabled by configuration. Use monitor button to turn on, then API can switch input/off.",
+                    },
+                )
+                return
+
+            if single_monitor and power in ("on", "off"):
+                results = apply_single_power(
+                    control_path,
+                    single_monitor,
+                    power,
+                    input_after_on=input_after_on,
+                    aggressive_on=aggressive_on,
+                )
+                has_error = any(item.get("status") != "ok" for item in results)
+                self._write_json(
+                    200 if not has_error else 500,
+                    {
+                        "ok": not has_error,
+                        "monitor": single_monitor,
+                        "power": power,
+                        "input_after_on": input_after_on,
+                        "aggressive_on": aggressive_on,
+                        "results": results,
+                    },
+                )
+                return
+
+            if power in ("on", "off"):
+                results = apply_power(control_path, power, input_after_on=input_after_on)
+                has_error = any(item.get("status") != "ok" for item in results)
+                self._write_json(
+                    200 if not has_error else 500,
+                    {
+                        "ok": not has_error,
+                        "power": power,
+                        "input_after_on": input_after_on,
+                        "results": results,
+                    },
+                )
+                return
+
             self._write_json(
-                200 if not has_error else 500,
+                400,
                 {
-                    "ok": not has_error,
-                    "profile": profile,
-                    "results": results,
+                    "ok": False,
+                    "error": "Use /mac, /pc, /set?profile=mac|pc, /off, /power?action=off, or /aorus/off",
                 },
             )
 
@@ -274,6 +470,9 @@ def run_http_server(control_path: str, host: str, port: int) -> int:
     print("GET /mac -> HDMI for both monitors")
     print("GET /pc  -> DP for both monitors")
     print("GET /set?profile=mac or /set?profile=pc")
+    print("GET /off -> power off both monitors")
+    print("GET /power?action=off")
+    print("GET /aorus/off (single monitor)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

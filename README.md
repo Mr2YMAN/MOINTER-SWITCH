@@ -70,12 +70,12 @@ python .\switch-input.py --profile mac
 python .\switch-input.py --profile pc
 ```
 
-## 7) HTTP GET API (mac/pc switch)
+## 7) HTTP GET API (mac/pc switch + power)
 
 Run server:
 
 ```powershell
-python .\switch-input.py --serve --host 127.0.0.1 --port 8765
+python .\switch-input.py --serve --host 0.0.0.0 --port 8765
 ```
 
 Then call with GET:
@@ -90,6 +90,15 @@ curl "http://127.0.0.1:8765/pc"
 # same via query format
 curl "http://127.0.0.1:8765/set?profile=mac"
 curl "http://127.0.0.1:8765/set?profile=pc"
+
+# power off all 3 monitors (xg27 + aorus + lg)
+curl "http://127.0.0.1:8765/off"
+
+# same via query format
+curl "http://127.0.0.1:8765/power?action=off"
+
+# AORUS-only power test endpoints
+curl "http://127.0.0.1:8765/aorus/off"
 ```
 
 ## 8) Auto start on Windows login
